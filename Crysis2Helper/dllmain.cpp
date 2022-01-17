@@ -1,5 +1,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+
 #include <iostream>
 #include <stdio.h>
 
@@ -11,293 +12,252 @@
 #pragma comment(lib, "CasualLibrary.lib")
 
 
-#include <dxgi.h>
-#include "kiero/kiero.h"
+#include "MinHook/MinHook.h"
+#if _WIN64 
+#pragma comment(lib, "MinHook/libMinHook.x64.lib")
+#else
+#pragma comment(lib, "MinHook/libMinHook.x86.lib")
+#endif
+
 #include "imgui/imgui.h"
 #include "imgui/imgui_impl_win32.h"
 #include "imgui/imgui_impl_dx11.h"
 
-#include "imgui_renderer/Renderer3D.h"
+#include "eigen-3.4.0/Eigen/Dense" // for dealing with quaternions
 
-typedef HRESULT(__stdcall* Present) (IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags);
-typedef LRESULT(CALLBACK* WNDPROC)(HWND, UINT, WPARAM, LPARAM);
-typedef uintptr_t PTR;
+#include "Geometry.h" // contains structs for math. Such as Vec3, Matrix34 etc.
 
-extern LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+typedef void (__stdcall* CmdFreeCamEnable)();
+typedef void(__stdcall* CmdFreeCamUnlockCamera)();
+CmdFreeCamUnlockCamera freeCamUnlockCamera = (CmdFreeCamUnlockCamera)0x00F3BC98;
+CmdFreeCamEnable freeCamEnable = (CmdFreeCamEnable)0x00F3C7F7;
 
-Present oPresent;
-HWND window = NULL;
-WNDPROC oWndProc;
-ID3D11Device* pDevice = NULL;
-ID3D11DeviceContext* pContext = NULL;
-ID3D11RenderTargetView* mainRenderTargetView;
-
-void InitImGui()
+typedef long(__stdcall* present)(IDXGISwapChain*, UINT, UINT);
+present p_present;
+present p_present_target;
+bool get_present_pointer()
 {
-	ImGui::CreateContext();
-	ImGuiIO& io = ImGui::GetIO();
-	io.ConfigFlags = ImGuiConfigFlags_NoMouseCursorChange;
-	ImGui_ImplWin32_Init(window);
-	ImGui_ImplDX11_Init(pDevice, pContext);
+	DXGI_SWAP_CHAIN_DESC sd;
+	ZeroMemory(&sd, sizeof(sd));
+	sd.BufferCount = 2;
+	sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+	sd.OutputWindow = GetForegroundWindow();
+	sd.SampleDesc.Count = 1;
+	sd.Windowed = TRUE;
+	sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+
+	IDXGISwapChain* swap_chain;
+	ID3D11Device* device;
+
+	const D3D_FEATURE_LEVEL feature_levels[] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0, };
+	if (D3D11CreateDeviceAndSwapChain(
+		NULL,
+		D3D_DRIVER_TYPE_HARDWARE,
+		NULL,
+		0,
+		feature_levels,
+		2,
+		D3D11_SDK_VERSION,
+		&sd,
+		&swap_chain,
+		&device,
+		nullptr,
+		nullptr) == S_OK)
+	{
+		void** p_vtable = *reinterpret_cast<void***>(swap_chain);
+		swap_chain->Release();
+		device->Release();
+		//context->Release();
+		p_present_target = (present)p_vtable[8];
+		return true;
+	}
+	return false;
 }
 
+WNDPROC oWndProc;
+extern LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 LRESULT __stdcall WndProc(const HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
-
 	if (true && ImGui_ImplWin32_WndProcHandler(hWnd, uMsg, wParam, lParam))
 		return true;
 
 	return CallWindowProc(oWndProc, hWnd, uMsg, wParam, lParam);
 }
 
-bool init = false;
+
+bool b_fly = false; // flag defining if fly hack is active
+float speed(0.1f); // the speed at which we fly
+void OverTheRainbow(); // forward declaration of THE function
+
 bool show_menu = false;
-bool draw_name = false;
-bool draw_esp = false;
-
-float sky_color[3] = { 0,0,0};
-float sun_color[3] = { 0,0,0};
-ImVec4 esp_color(1, 1, 1, 1);
-
-float sky_brightness = 1;
-
-//CAISystem* pCAISystem = nullptr;
-IRenderer* pIRenderer = nullptr;
-IEntitySystem* pIEntitySystem = nullptr;
-IConsole* pIConsole = nullptr;
-
-HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags)
+bool init = false;
+HWND window = NULL;
+ID3D11Device* p_device = NULL;
+ID3D11DeviceContext* p_context = NULL;
+ID3D11RenderTargetView* mainRenderTargetView = NULL;
+HRESULT __stdcall detour_present(IDXGISwapChain* p_swap_chain, UINT sync_interval, UINT flags)
 {
 	if (!init)
 	{
-		if (SUCCEEDED(pSwapChain->GetDevice(__uuidof(ID3D11Device), (void**)&pDevice)))
+		if (SUCCEEDED(p_swap_chain->GetDevice(__uuidof(ID3D11Device), (void**)&p_device)))
 		{
-			pDevice->GetImmediateContext(&pContext);
+			p_device->GetImmediateContext(&p_context);
 			DXGI_SWAP_CHAIN_DESC sd;
-			pSwapChain->GetDesc(&sd);
+			p_swap_chain->GetDesc(&sd);
 			window = sd.OutputWindow;
 			ID3D11Texture2D* pBackBuffer;
-			pSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (LPVOID*)&pBackBuffer);
-			pDevice->CreateRenderTargetView(pBackBuffer, NULL, &mainRenderTargetView);
+			p_swap_chain->GetBuffer(0, __uuidof(ID3D11Texture2D), (LPVOID*)&pBackBuffer);
+			p_device->CreateRenderTargetView(pBackBuffer, NULL, &mainRenderTargetView);
 			pBackBuffer->Release();
 			oWndProc = (WNDPROC)SetWindowLongPtr(window, GWLP_WNDPROC, (LONG_PTR)WndProc);
-			InitImGui();
+			ImGui::CreateContext();
+			ImGuiIO& io = ImGui::GetIO();
+			io.ConfigFlags = ImGuiConfigFlags_NoMouseCursorChange;
+			ImGui_ImplWin32_Init(window);
+			ImGui_ImplDX11_Init(p_device, p_context);
 			init = true;
 		}
-
 		else
-			return oPresent(pSwapChain, SyncInterval, Flags);
+			return p_present(p_swap_chain, sync_interval, flags);
 	}
 
 	ImGui_ImplDX11_NewFrame();
 	ImGui_ImplWin32_NewFrame();
 	ImGui::NewFrame();
-	
+
 	if (show_menu) {
 
 		ImGui::Begin("Test Env", &show_menu);
 		ImGui::Text("Options:");
-		ImGui::ColorEdit3("Sky Color", sky_color);
-		ImGui::ColorEdit3("Sun Color", sun_color);
-		ImGui::ColorEdit4("ESP Color", (float*)&esp_color);
-		ImGui::SliderFloat("SkyBrightness", &sky_brightness, 0, 1000);
-		ImGui::Checkbox("Name", &draw_name);
-		ImGui::Checkbox("ESP", &draw_esp);
+		ImGui::Checkbox("Fly", &b_fly);
+		ImGui::SliderFloat("Speed", &speed, 0.01, 1);
 		ImGui::End();
 	}
 
-	if (draw_name || draw_esp) {
-
-		Casual::Renderer::BeginScene();
-
-		//CAIDebugRenderer* pCAIDebugRenderer = pCAISystem->GetAIDebugRenderer();
-		IEntityIt* pEntityIter = pIEntitySystem->GetEntityIterator();
-
-		IEntity* pEntity = 0;
-		if (pEntityIter)
-		{
-			pEntity = pEntityIter->This();
-		}
-
-		while (pEntity)
-		{
-			pEntityIter->Next();
-			pEntity = pEntityIter->This();
-			if (pEntity) {
-				//pIConsole->PrintLine(pEntity->GetName());
-				if (pEntity->IsActive() && pEntity->HasAI() && !pEntity->CheckFlags(EEntityFlags::ENTITY_FLAG_LOCAL_PLAYER)) {
-					if (draw_name) {
-						//pCAIDebugRenderer->Draw3dLabel(pEntity->GetPos(), 2, pEntity->GetName(), va_list());
-					}
-					if (draw_esp) {
-						AABB aabb;
-						pEntity->GetWorldBounds(aabb);
-						float height = aabb.GetSize().z;
-						Vec3 center3d = aabb.GetCenter();
-						Vec3 bottom_center3d = center3d - Vec3(0, 0, height * 0.5);
-						Vec3 top_center3d = center3d + Vec3(0, 0, height * 0.5);
-
-						Vec3 rect_min2d, rect_max2d, top_center2d;
-						pIRenderer->ProjectToScreen(aabb.min.x, aabb.min.y, aabb.min.z, &rect_min2d.x, &rect_min2d.y, &rect_min2d.z);
-						pIRenderer->ProjectToScreen(aabb.max.x, aabb.max.y, aabb.max.z, &rect_max2d.x, &rect_max2d.y, &rect_max2d.z);
-						pIRenderer->ProjectToScreen(top_center3d.x, top_center3d.y, top_center3d.z, &top_center2d.x, &top_center2d.y, &top_center2d.z);
-
-						Camera cam = Camera(pIRenderer);
-						Casual::Renderer3D test = Casual::Renderer3D(&cam);
-
-						//test.DrawCapsuleOutline(bottom_center3d, top_center3d, height, esp_color);
-						Vec3 offset = Vec3(0, 0.1, 1) * height;
-
-						test.DrawArrow(top_center3d + offset, offset*-1, height/2, esp_color);
-
-						int width = pIRenderer->GetWidth();
-						int screen_height = pIRenderer->GetHeight();
-
-						if ((rect_min2d.z >= 0.0f) && (rect_min2d.z <= 1.0f)) {
-
-							ImVec2 im_min = ImVec2(rect_min2d.x * width * 0.01, rect_min2d.y * screen_height * 0.01);
-							ImVec2 im_max = ImVec2(rect_max2d.x * width * 0.01, rect_max2d.y * screen_height * 0.01);
-							ImVec2 im_top_center = ImVec2(top_center2d.x * width * 0.01, top_center2d.y * screen_height * 0.01);
-							ImVec2 im_bottom_right = ImVec2(im_max.x,im_min.y);
-
-							ImVec2 triangle[3] = { im_min, im_top_center, im_bottom_right };
-
-							//Casual::Renderer::PolyLine(triangle, 3, false, esp_color, 2);
-
-							//Casual::Renderer::TriangleFilled(im_min, im_top_center, im_bottom_right, esp_color);
-							//Casual::Renderer::RectFilled(im_min, im_max, esp_color);
-						}
-					}
-				}
-			}
-		}
-		Casual::Renderer::EndScene();
+	if (b_fly) {
+		OverTheRainbow();
 	}
-
 
 	ImGui::EndFrame();
 	ImGui::Render();
 
-	pContext->OMSetRenderTargets(1, &mainRenderTargetView, NULL);
+	p_context->OMSetRenderTargets(1, &mainRenderTargetView, NULL);
 	ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 
-
-	return oPresent(pSwapChain, SyncInterval, Flags);
+	return p_present(p_swap_chain, sync_interval, flags);
 }
 
-HINSTANCE DllHandle;
-
-
-
+HINSTANCE dll_handle;
 DWORD __stdcall EjectThread(LPVOID lpParameter) {
 	Sleep(100);
-	FreeLibraryAndExitThread(DllHandle, 0);
+	FreeLibraryAndExitThread(dll_handle, 0);
+	Sleep(100);
 	return 0;
 }
 
+VOID SetCurrentThreadId(DWORD dwThreadId)
+{
+	_asm
+	{
+		mov eax, fs: [0x18] ;
+		mov ecx, dwThreadId;
+		mov[eax + 0x24], ecx;
+	}
+}
+
+
+IEntity* me = nullptr;
 int WINAPI main()
 {
-	bool init_hook = false;
-	do
-	{
-		if (kiero::init(kiero::RenderType::D3D11) == kiero::Status::Success)
-		{
-			kiero::bind(8, (void**)&oPresent, hkPresent);
-			init_hook = true;
-		}
-	} while (!init_hook);
 
+	#pragma region init_dx11
+	if (!get_present_pointer())
+	{
+		return 1;
+	}
+
+	MH_STATUS status = MH_Initialize();
+	if (status != MH_OK)
+	{
+		return 1;
+	}
+
+	if (MH_CreateHook(reinterpret_cast<void**>(p_present_target), &detour_present, reinterpret_cast<void**>(&p_present)) != MH_OK) {
+		return 1;
+	}
+
+	if (MH_EnableHook(p_present_target) != MH_OK) {
+		return 1;
+	}
+	#pragma endregion
+
+	// all this just to get the entity and from there the writable position. All game specific stuff.
 	uintptr_t module_ptr = Memory::Internal::getModule("Crysis2.exe");
 
 	IGameFramework* pIGameFramework = *(IGameFramework**)(module_ptr + 0x13A0050);
+	ISystem* pISystem = pIGameFramework->GetISystem();
 
-	ISystem* pISystem = pIGameFramework->GetISystem();//*(ISystem**)(module_ptr + 0x1339704);
-
-	I3DEngine* pI3DEngine = pISystem->GetI3DEngine();
 	IInput* pIInput = pISystem->GetIInput();
 	IHardwareMouse* pIHardwareMouse = pISystem->GetIHardwareMouse();
 
-	pIConsole = pISystem->GetIConsole();
-	//pCAISystem = pISystem->GetCAISystem();
-	pIEntitySystem = pISystem->GetIEntitySystem();
-	pIRenderer = pISystem->GetIRenderer();
+	IEntitySystem* pIEntitySystem = pISystem->GetIEntitySystem();
+	me = pIEntitySystem->GetEntity(30583);
 
-	pIConsole->Clear();
-	pIConsole->PrintLine("You just got H4CKED bro\n\n");
-	pIConsole->PrintLine(" [N0] to toggle menu");
-	pIConsole->PrintLine(" [N1] to exit");
-
-	//ll_entity_entry* p_ll_entity_entry = pISystem->pEntitySystem->p_linked_list_1;
-
-	//something_camera* p_renderer = p_system_global_environment->p_something_camera;
-
-	//Camera* camera = p_renderer->get_camera();
-
-	//std::cout << "cam pointer: " << std::hex << camera << std::endl;
-
-	//std::cout << p_system_global_environment << std::endl;
-	//std::cout << p_ll_entity_entry << std::endl;
 
 	while (true) {
 		Sleep(50);
-		pI3DEngine->SetSkyColor(sky_color[0], sky_color[1], sky_color[2]);
-		pI3DEngine->SetSunColor(sun_color[0], sun_color[1], sun_color[2]);
-		pI3DEngine->SetSkyBrightness(sky_brightness);
-		if (GetAsyncKeyState(VK_NUMPAD0) & 1) {
+		if (GetAsyncKeyState(VK_ESCAPE) & 1) {
 			show_menu = !show_menu;
 
 			if (show_menu) {
+				//if we show the menu we pause the game and show the mouse. Again: game specific
 				pIGameFramework->PauseGame(true, false, 0);
 				pIHardwareMouse->IncrementCounter();
 			}
 			else 
 			{
+				//if we hide the menu we unpause the game and hide the cursor.
 				pIGameFramework->PauseGame(false, false, 0);
 				pIHardwareMouse->DecrementCounter();
 			}
-
-			//pIInput->EnableDevice(!show_menu);
+			Sleep(500);
 		}
 
-		//	//ll_entity_entry* p_ll_entity_entry = p_system_global_environment->pEntitySystem->p_linked_list_1;
-		//	//while (p_ll_entity_entry) {
-		//	//	if (p_ll_entity_entry->pEntity != 0) {
-		//	//		std::cout << "p_linked_list: " << std::hex << p_ll_entity_entry << std::endl;
-		//	//		std::cout << "Entity Index: " << std::dec << p_ll_entity_entry->entity_index << std::endl;
-		//	//		std::cout << "p_entity: " << std::hex << p_ll_entity_entry->pEntity << std::endl;
-		//	//		std::cout << "Entity ID: " << std::dec << p_ll_entity_entry->pEntity->entity_id << std::endl;
-		//	//		std::cout << "Entity Position: " << std::dec << p_ll_entity_entry->pEntity->position << std::endl << std::endl;
-
-		//	//		p_ll_entity_entry = p_ll_entity_entry->down;
-		//	//	}
-		//	//}
-
-		//	Sleep(1000);
-		//}
-		//pI3DEngine->SetSkyColor(100, 0, 0);
-		//pI3DEngine->SetSunColor(0, 0, 100);
-
+		//break the loop -> time for cleanup and unloading
 		if (GetAsyncKeyState(VK_NUMPAD1)) {
-			pIConsole->PrintLine("ight imma head out");
 			break;
 		}
 	}
 
-	//std::cout << "ight imma head out" << std::endl;
-	Sleep(1000);
-	//fclose(fp);
-	//FreeConsole();
+	#pragma region cleanup
+
+	if (MH_DisableHook(MH_ALL_HOOKS) != MH_OK) {
+		return 1;
+	}
+	if (MH_Uninitialize() != MH_OK) {
+		return 1;
+	}
+
+	ImGui_ImplDX11_Shutdown();
+	ImGui_ImplWin32_Shutdown();
+	ImGui::DestroyContext();
+
+	if (mainRenderTargetView) { mainRenderTargetView->Release(); mainRenderTargetView = NULL; }
+	if (p_context) { p_context->Release(); p_context = NULL; }
+	if (p_device) { p_device->Release(); p_device = NULL; }
+	SetWindowLongPtr(window, GWLP_WNDPROC, (LONG_PTR)(oWndProc));
+
 	CreateThread(0, 0, EjectThread, 0, 0, 0);
+	#pragma endregion
 
 	return 0;
 }
-
-
 
 BOOL __stdcall DllMain(HINSTANCE hModule, DWORD dwReason, LPVOID lpReserved)
 {
 	if (dwReason == DLL_PROCESS_ATTACH)
 	{
-		DllHandle = hModule;
+		dll_handle = hModule;
 		CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)main, NULL, 0, NULL);
 	}
 	else if (dwReason == DLL_PROCESS_DETACH)
@@ -306,4 +266,55 @@ BOOL __stdcall DllMain(HINSTANCE hModule, DWORD dwReason, LPVOID lpReserved)
 	}
 
 	return TRUE;
+}
+
+// implementation of the fly hack as shown in the video 
+void OverTheRainbow() {
+
+	PhysicalEntity* pMyPhysicalEntity = me->m_pGridLocationIt->This->pPhysicalClass; // get the class instance containing the writable position
+	CameraEx* pCameraEx = (CameraEx*)0x017A8E30; // get the camera to find those vectors
+	Vec3 viewDir = pCameraEx->m_Matrix.GetColumn1(); // the view direction vector. Already normalized.
+	Vec3 up = pCameraEx->m_Matrix.GetColumn2(); // the up vector, also normalized
+	Vec3 right = viewDir.cross(up); // the right vector created by taking the cross product. Since both other vectors are normalized so is this one.
+
+	//get user input
+	SHORT numpad4 = GetAsyncKeyState(VK_NUMPAD4); // 4, left
+	SHORT numpad5 = GetAsyncKeyState(VK_NUMPAD5); // 5, backward
+	SHORT numpad6 = GetAsyncKeyState(VK_NUMPAD6); // 6, right
+	SHORT numpad7 = GetAsyncKeyState(VK_NUMPAD7); // 7, down
+	SHORT numpad8 = GetAsyncKeyState(VK_NUMPAD8); // 8, forward
+	SHORT numpad9 = GetAsyncKeyState(VK_NUMPAD9); // 9, up
+
+	Vec3 oldPos = pMyPhysicalEntity->pos; // current player position, will be changed
+	Vec3 velocity = Vec3(0, 0, 0); // set velocity to 0 here. You may also not do that but then it is hard to manover ;)
+
+	if (numpad8 != 0) // Forward
+		velocity = velocity + viewDir;
+
+	if (numpad5 != 0) // Backward
+		velocity = velocity - viewDir;
+
+	if (numpad9 != 0) // Up
+		velocity = velocity + up;
+
+	if (numpad7 != 0) // Down
+		velocity = velocity - up;
+
+	if (numpad6 != 0) // Right
+		velocity = velocity + right;
+
+	if (numpad4 != 0) // Left
+		velocity = velocity - right;
+
+	velocity.Normalize();
+
+	// I left those comments below in here. Maybe it helps you understand how to use the Eigen library to get the euler angles from a quaternion
+
+	//Eigen::Quaternionf q = Eigen::Quaternionf(pMyPhysicalEntity->angle.w, 
+	//	pMyPhysicalEntity->angle.x, pMyPhysicalEntity->angle.y, pMyPhysicalEntity->angle.z);
+	//Eigen::Vector3f euler = q.toRotationMatrix().eulerAngles(0, 1, 2);
+
+	// Set new position.
+	pMyPhysicalEntity->pos = oldPos + velocity * speed;
+
 }
